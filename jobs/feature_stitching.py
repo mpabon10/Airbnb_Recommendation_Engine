@@ -1,3 +1,39 @@
+"""
+feature_stitching.py
+====================
+Pipeline Step 7: Feature Assembly & Dictionary Creation
+
+Combines three independent feature families into a single unified feature
+table per user–listing pair:
+
+  1. **User RFM bins** – Recency, Frequency, and Monetary values are
+     discretised into "high"/"medium"/"low" bins (one-hot encoded as 1.0).
+  2. **User affinities** – Per-metadata affinity scores computed in
+     affinities.py, representing how much a user’s behaviour deviates
+     from their cohort for each metadata facet.
+  3. **Listing metadata** – Categorical attributes of the candidate
+     listing itself (superhost status, neighbourhood, price bin, etc.),
+     each encoded as 1.0.
+
+The three feature sets are unioned into a long-format table:
+  (user_id, listing_id, label, frequency, feature_class, feature_type,
+   feature_category, feature_value)
+
+During the training pass, a **feature dictionary** is also generated that
+assigns a unique integer ID to every distinct (feature_class, feature_type,
+feature_category) combination.  This dictionary is reused in the scoring
+pass to ensure consistent feature indexing.
+
+Inputs:
+  - data/{training,scoring}/ones_and_zeros_rfm_parquet   (from ones_n_zeros.py)
+  - data/{training,scoring}/affinities_parquet           (from affinities.py)
+  - data/listing_metadata_parquet                        (from metadata.py)
+
+Outputs:
+  - data/{training,scoring}/features_values_label_parquet
+  - data/training/feature_dictionary_csv   (training pass only)
+"""
+
 import pandas as pd
 import numpy as np
 
@@ -11,6 +47,10 @@ spark = SparkSession.builder.master("local[4]").appName("Stitching").getOrCreate
 data_sets=['training','scoring']
 
 for ds in data_sets:
+    # -----------------------------------------------------------------
+    # 1. Load RFM data and bin Recency / Frequency / Monetary into
+    #    "high" / "medium" / "low" categories
+    # -----------------------------------------------------------------
     ones_and_zeros_rfm=spark.read.parquet(f'data/{ds}/ones_and_zeros_rfm_parquet')
     max_recency=ones_and_zeros_rfm.select(max("recency")).collect()[0][0]
     max_frequency=ones_and_zeros_rfm.select(max("frequency")).collect()[0][0]
@@ -41,6 +81,9 @@ for ds in data_sets:
 
     col_list=['user_id','listing_id','label','frequency']
 
+    # -----------------------------------------------------------------
+    # 2. Create user RFM feature rows (one-hot style, value = 1.0)
+    # -----------------------------------------------------------------
     user_rfm=ones_and_zeros_rfm_bins.select(*col_list
         ,lit('user_rfm').alias('feature_class')
         ,lit('recency').alias('feature_type')
@@ -62,7 +105,9 @@ for ds in data_sets:
             )
         )
 
-
+    # -----------------------------------------------------------------
+    # 3. Load affinity features (continuous values per metadata facet)
+    # -----------------------------------------------------------------
     affinities=spark.read.parquet(f'data/{ds}/affinities_parquet')
     user_affinity=affinities.select(*col_list
         ,lit('user_affinities').alias('feature_class')
@@ -71,8 +116,9 @@ for ds in data_sets:
         ,col('affinity').alias('feature_value')
         )
 
-
-
+    # -----------------------------------------------------------------
+    # 4. Load listing metadata features (one-hot style, value = 1.0)
+    # -----------------------------------------------------------------
     metadata=spark.read.parquet('data/listing_metadata_parquet')
     listing_features=metadata.select('listing_id'
         ,lit('listing').alias('feature_class')
@@ -81,6 +127,9 @@ for ds in data_sets:
         ,lit(1.0).alias('feature_value')
     )
 
+    # -----------------------------------------------------------------
+    # 5. Union all three feature families and write to Parquet
+    # -----------------------------------------------------------------
     feature_values_labels=((ones_and_zeros_rfm.select(*col_list)
         .join(user_rfm, [*col_list],'inner'))
         .select(*col_list,'feature_class','feature_type','feature_category','feature_value')
@@ -98,6 +147,12 @@ for ds in data_sets:
 
     feature_values_labels.write.mode('overwrite').parquet(f'data/{ds}/features_values_label_parquet')
     
+    # -----------------------------------------------------------------
+    # 6. (Training only) Build a feature dictionary mapping each unique
+    #    (feature_class, feature_type, feature_category) to a sequential
+    #    integer ID.  This dictionary is reused during scoring to ensure
+    #    consistent sparse-vector indexing.
+    # -----------------------------------------------------------------
     if ds=='training':
         feature_values_labels=spark.read.parquet('data/training/features_values_label_parquet')
         rowWindowSpec=Window.orderBy('feature_class','feature_type','feature_category')

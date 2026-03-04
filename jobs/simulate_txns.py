@@ -1,3 +1,29 @@
+"""
+simulate_txns.py
+================
+Pipeline Step 3: Synthetic User & Transaction Generation
+
+Generates a synthetic dataset of 10,000 users, each with an exponentially-
+distributed booking frequency (1–30 bookings).  Transactions are created
+iteratively:
+  - Booking #1: a random listing is assigned to each user.
+  - Booking #2+: the next listing is chosen from the top-100 most similar
+    listings (produced by listing_similarity.py), with an exponential bias
+    toward higher-similarity listings.
+
+Each transaction record also tracks:
+  - days_since_last  – random gap between bookings
+  - running_avg_price – cumulative average nightly price up to that booking
+
+Inputs:
+  - data/nyc_listing_data_5pcnt_sample.csv
+  - data/top_100_sim_listings_parquet   (from listing_similarity.py)
+
+Outputs:
+  - data/users_parquet
+  - data/transactions_parquet  (partitioned by booking_num)
+"""
+
 import pandas as pd
 import numpy as np
 import shutil
@@ -12,8 +38,9 @@ from builtins import max as maxx
 
 spark = SparkSession.builder.master("local[4]").appName("TestApp").getOrCreate()
 
-
-# Define the schema
+# ---------------------------------------------------------------------------
+# 1. Load the listing sample with an explicit schema
+# ---------------------------------------------------------------------------
 listing_schema = StructType([
     StructField("listing_id", IntegerType(), True),
     StructField("host_is_superhost", IntegerType(), True),
@@ -28,7 +55,11 @@ listing_df.show()
 
 max_listing_id = listing_df.select(max("listing_id")).collect()[0][0]
 
-# Function to generate an exponentially distributed random number between 1 and max_num
+# ---------------------------------------------------------------------------
+# 2. Helper UDF – generate an exponentially-distributed random int in [1, max_num].
+#    The steep decay (lambda=10.5) ensures most values are small, mimicking
+#    real-world booking frequency behaviour.
+# ---------------------------------------------------------------------------
 def exponential_random(max_num):
     # Scale factor (λ) controls the steepness of the exponential decay
     # Higher lambda means steeper decay (fewer higher values)
@@ -43,10 +74,13 @@ def exponential_random(max_num):
     # Ensure the value is at least 1
     return maxx(1, scaled_value)
 
-# Register the function as a UDF in Spark
+# Register the function as a Spark UDF
 exp_random_udf = udf(exponential_random, IntegerType())
 
-# Set the max frequency
+# ---------------------------------------------------------------------------
+# 3. Create a user table with 10,000 synthetic users, each assigned a
+#    random booking frequency drawn from the exponential distribution.
+# ---------------------------------------------------------------------------
 num_users=10000
 max_freq = 30
 #user IDs
@@ -58,6 +92,9 @@ user_df.write.mode('overwrite').parquet('data/users_parquet')
 
 user_df=spark.read.parquet('data/users_parquet')
 
+# ---------------------------------------------------------------------------
+# 4. Load listing similarity data to drive correlated sequential bookings
+# ---------------------------------------------------------------------------
 sim_listings=spark.read.parquet('data/top_100_sim_listings_parquet')\
     .select(col('listing_id_x').alias('listing_id'),col('listing_id_y').alias('sim_listing_id'),'similarity_rank')
 
@@ -65,7 +102,12 @@ sim_listings=spark.read.parquet('data/top_100_sim_listings_parquet')\
 
 max_sim_listing=sim_listings.select(max("similarity_rank")).collect()[0][0]
 
-
+# ---------------------------------------------------------------------------
+# 5. Build transactions iteratively, one booking round at a time
+#    - Round 1: assign a random listing to every user.
+#    - Round 2+: pick a similar listing (biased toward high similarity)
+#      and attach a random days-since-last gap and running avg price.
+# ---------------------------------------------------------------------------
 txns_path='data/transactions_parquet'
 # Check if the directory exists
 if os.path.exists(txns_path):
@@ -119,6 +161,9 @@ for booking in range(1,max_freq+1):
 
 
 
+# ---------------------------------------------------------------------------
+# 6. Validate: ensure every user's transaction count matches their frequency
+# ---------------------------------------------------------------------------
 transactions=spark.read.parquet('data/transactions_parquet')
 transactions.count()
 transactions.orderBy('user_id','booking_num').show()
